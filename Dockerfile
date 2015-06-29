@@ -25,37 +25,12 @@ ENV KERNEL_VERSION  4.0.5
 RUN curl --retry 10 https://www.kernel.org/pub/linux/kernel/v${KERNEL_VERSION%%.*}.x/linux-$KERNEL_VERSION.tar.xz | tar -C / -xJ && \
     mv /linux-$KERNEL_VERSION /linux-kernel
 
-# http://aufs.sourceforge.net/
-ENV AUFS_REPO       https://github.com/sfjro/aufs4-standalone
-ENV AUFS_BRANCH     aufs4.0
-ENV AUFS_COMMIT     a8c8a849e236d7f7fa121c8344899a796ccf7b8f
-# we use AUFS_COMMIT to get stronger repeatability guarantees
-
-# Download AUFS and apply patches and files, then remove it
-RUN git clone -b "$AUFS_BRANCH" "$AUFS_REPO" /aufs-standalone && \
-    cd /aufs-standalone && \
-    git checkout -q "$AUFS_COMMIT" && \
-    cd /linux-kernel && \
-    cp -r /aufs-standalone/Documentation /linux-kernel && \
-    cp -r /aufs-standalone/fs /linux-kernel && \
-    cp -r /aufs-standalone/include/uapi/linux/aufs_type.h /linux-kernel/include/uapi/linux/ && \
-    set -e && for patch in \
-        /aufs-standalone/aufs*-kbuild.patch \
-        /aufs-standalone/aufs*-base.patch \
-        /aufs-standalone/aufs*-mmap.patch \
-        /aufs-standalone/aufs*-standalone.patch \
-        /aufs-standalone/aufs*-loopback.patch \
-    ; do \
-        patch -p1 < "$patch"; \
-    done
-
 COPY kernel_config /linux-kernel/.config
 
 RUN jobs=$(nproc); \
     cd /linux-kernel && \
-    make -j ${jobs} oldconfig && \
-    make -j ${jobs} bzImage && \
-    make -j ${jobs} modules
+    ARCH=um make -j ${jobs} oldconfig && \
+    ARCH=um make -j ${jobs} modules
 
 # The post kernel build process
 
@@ -82,48 +57,6 @@ RUN mkdir -p $ROOTFS
 # Prepare the build directory (/tmp/iso)
 RUN mkdir -p /tmp/iso/boot
 
-# Install the kernel modules in $ROOTFS
-RUN cd /linux-kernel && \
-    make INSTALL_MOD_PATH=$ROOTFS modules_install firmware_install
-
-# Remove useless kernel modules, based on unclejack/debian2docker
-RUN cd $ROOTFS/lib/modules && \
-    rm -rf ./*/kernel/sound/* && \
-    rm -rf ./*/kernel/drivers/gpu/* && \
-    rm -rf ./*/kernel/drivers/infiniband/* && \
-    rm -rf ./*/kernel/drivers/isdn/* && \
-    rm -rf ./*/kernel/drivers/media/* && \
-    rm -rf ./*/kernel/drivers/staging/lustre/* && \
-    rm -rf ./*/kernel/drivers/staging/comedi/* && \
-    rm -rf ./*/kernel/fs/ocfs2/* && \
-    rm -rf ./*/kernel/net/bluetooth/* && \
-    rm -rf ./*/kernel/net/mac80211/* && \
-    rm -rf ./*/kernel/net/wireless/*
-
-# Install libcap
-RUN curl -L http://http.debian.net/debian/pool/main/libc/libcap2/libcap2_2.22.orig.tar.gz | tar -C / -xz && \
-    cd /libcap-2.22 && \
-    sed -i 's/LIBATTR := yes/LIBATTR := no/' Make.Rules && \
-    make && \
-    mkdir -p output && \
-    make prefix=`pwd`/output install && \
-    mkdir -p $ROOTFS/usr/local/lib && \
-    cp -av `pwd`/output/lib64/* $ROOTFS/usr/local/lib
-
-# Make sure the kernel headers are installed for aufs-util, and then build it
-RUN cd /linux-kernel && \
-    make INSTALL_HDR_PATH=/tmp/kheaders headers_install && \
-    cd / && \
-    git clone http://git.code.sf.net/p/aufs/aufs-util && \
-    cd /aufs-util && \
-    git checkout aufs4.0 && \
-    CPPFLAGS="-I/tmp/kheaders/include" CLFAGS=$CPPFLAGS LDFLAGS=$CPPFLAGS make && \
-    DESTDIR=$ROOTFS make install && \
-    rm -rf /tmp/kheaders
-
-# Prepare the ISO directory with the kernel
-RUN cp -v /linux-kernel/arch/x86_64/boot/bzImage /tmp/iso/boot/vmlinuz64
-
 # Download the rootfs, don't unpack it though:
 RUN curl -L -o /tcl_rootfs.gz $TCL_REPO_BASE/release/distribution_files/rootfs64.gz
 
@@ -139,92 +72,7 @@ RUN for dep in $TCZ_DEPS; do \
 RUN curl -L -o $ROOTFS/usr/local/bin/generate_cert https://github.com/SvenDowideit/generate_cert/releases/download/0.1/generate_cert-0.1-linux-386/ && \
     chmod +x $ROOTFS/usr/local/bin/generate_cert
 
-# Build VBox guest additions
-ENV VBOX_VERSION 4.3.28
-RUN mkdir -p /vboxguest && \
-    cd /vboxguest && \
-    \
-    curl -L -o vboxguest.iso http://download.virtualbox.org/virtualbox/${VBOX_VERSION}/VBoxGuestAdditions_${VBOX_VERSION}.iso && \
-    7z x vboxguest.iso -ir'!VBoxLinuxAdditions.run' && \
-    rm vboxguest.iso && \
-    \
-    sh VBoxLinuxAdditions.run --noexec --target . && \
-    mkdir amd64 && tar -C amd64 -xjf VBoxGuestAdditions-amd64.tar.bz2 && \
-    rm VBoxGuestAdditions*.tar.bz2 && \
-    \
-    KERN_DIR=/linux-kernel/ make -C amd64/src/vboxguest-${VBOX_VERSION} && \
-    cp amd64/src/vboxguest-${VBOX_VERSION}/*.ko $ROOTFS/lib/modules/$KERNEL_VERSION-boot2docker/ && \
-    \
-    mkdir -p $ROOTFS/sbin && \
-    cp amd64/lib/VBoxGuestAdditions/mount.vboxsf $ROOTFS/sbin/
-
-# Install build dependencies for VMware Tools
-RUN apt-get update && apt-get install -y \
-        autoconf \
-        libdumbnet-dev \
-        libdumbnet1 \
-        libfuse-dev \
-        libfuse2 \
-        libfuse2 \
-        libglib2.0-0 \
-        libglib2.0-dev \
-        libmspack-dev \
-        libssl-dev \
-        libtirpc-dev \
-        libtirpc1 \
-        libtool \
-    && rm -rf /var/lib/apt/lists/*
-
-# Build VMware Tools
-ENV OVT_VERSION 9.10.0
-
-# use fixes for post 3.19 and 4.0 kernels from https://github.com/davispuh/open-vm-tools/tree/fixed and http://git.io/vIXpn
-# rebased onto the 9.10.0 release
-ENV OVT_REPO       https://github.com/cloudnativeapps/open-vm-tools
-ENV OVT_BRANCH     stable-9.10.x-kernel4-vmhgfs-fix
-ENV OVT_COMMIT     f654bdb390dd6753985379ea7df058aa8f6294ee
-
-RUN git clone -b "$OVT_BRANCH" "$OVT_REPO" /vmtoolsd \
-    && cd /vmtoolsd \
-    && git checkout -q "$OVT_COMMIT"
-
-# Compile
-RUN cd /vmtoolsd/open-vm-tools && \
-    autoreconf -i && \
-    ./configure --disable-multimon --disable-docs --disable-tests --with-gnu-ld \
-                --without-kernel-modules --without-procps --without-gtk2 \
-                --without-gtkmm --without-pam --without-x --without-icu \
-                --without-xerces --without-xmlsecurity --without-ssl && \
-    make LIBS="-ltirpc" CFLAGS="-Wno-implicit-function-declaration" && \
-    make DESTDIR=$ROOTFS install &&\
-    /vmtoolsd/open-vm-tools/libtool --finish $ROOTFS/usr/local/lib
-
-# Kernel modules to build and install
-ENV VM_MODULES  vmhgfs
-
-RUN cd /vmtoolsd/open-vm-tools &&\
-    TOPDIR=$PWD &&\
-    for module in $VM_MODULES; do \
-        cd modules/linux/$module; \
-        make -C /linux-kernel modules M=$PWD VM_CCVER=$(gcc -dumpversion) HEADER_DIR="/linux-kernel/include" SRCROOT=$PWD OVT_SOURCE_DIR=$TOPDIR; \
-        cd -; \
-    done && \
-    for module in $VM_MODULES; do \
-        make -C /linux-kernel INSTALL_MOD_PATH=$ROOTFS modules_install M=$PWD/modules/linux/$module; \
-    done
-
-ENV LIBDNET libdnet-1.11
-
-RUN mkdir -p /vmtoolsd/${LIBDNET} &&\
-    curl -L http://sourceforge.net/projects/libdnet/files/libdnet/${LIBDNET}/${LIBDNET}.tar.gz \
-        | tar -xzC /vmtoolsd/${LIBDNET} --strip-components 1 &&\
-    cd /vmtoolsd/${LIBDNET} && ./configure --build=i486-pc-linux-gnu &&\
-    make &&\
-    make install && make DESTDIR=$ROOTFS install
-
-# Horrible hack again
-RUN cd $ROOTFS && cd usr/local/lib && ln -s libdnet.1 libdumbnet.so.1 &&\
-    cd $ROOTFS && ln -s lib lib64
+RUN mkdir -p /rootfs/lib/modules/4.0.5-boot2docker
 
 # Make sure that all the modules we might have added are recognized (especially VBox guest additions)
 RUN depmod -a -b $ROOTFS $KERNEL_VERSION-boot2docker
@@ -258,15 +106,6 @@ COPY rootfs/rootfs $ROOTFS
 RUN cd $ROOTFS \
     && ln -s /usr/local/etc/acpi etc/ \
     && ln -s /usr/local/sbin/ip usr/sbin/
-
-# Build the Hyper-V KVP Daemon
-RUN cd /linux-kernel && \
-    make INSTALL_HDR_PATH=/tmp/kheaders headers_install && \
-    cd /linux-kernel/tools/hv && \
-    sed -i 's!\(^CFLAGS = .*\)!\1 -I/tmp/kheaders/include!' Makefile && \
-    make hv_kvp_daemon && \
-    cp hv_kvp_daemon $ROOTFS/usr/sbin && \
-    rm -rf /tmp/kheaders
 
 # These steps can only be run once, so can't be in make_iso.sh (which can be run in chained Dockerfiles)
 # see https://github.com/boot2docker/boot2docker/blob/master/doc/BUILD.md
@@ -305,4 +144,40 @@ COPY rootfs/make_iso.sh /
 
 RUN /make_iso.sh
 
-CMD ["cat", "boot2docker.iso"]
+# Install the kernel modules in $ROOTFS
+RUN cd /linux-kernel && \
+    make INSTALL_MOD_PATH=$ROOTFS modules_install firmware_install
+
+# Remove useless kernel modules, based on unclejack/debian2docker
+RUN cd $ROOTFS/lib/modules && \
+    rm -rf ./*/kernel/sound/* && \
+    rm -rf ./*/kernel/drivers/gpu/* && \
+    rm -rf ./*/kernel/drivers/infiniband/* && \
+    rm -rf ./*/kernel/drivers/isdn/* && \
+    rm -rf ./*/kernel/drivers/media/* && \
+    rm -rf ./*/kernel/drivers/staging/lustre/* && \
+    rm -rf ./*/kernel/drivers/staging/comedi/* && \
+    rm -rf ./*/kernel/fs/ocfs2/* && \
+    rm -rf ./*/kernel/net/bluetooth/* && \
+    rm -rf ./*/kernel/net/mac80211/* && \
+    rm -rf ./*/kernel/net/wireless/*
+
+# Install libcap
+RUN curl -L http://http.debian.net/debian/pool/main/libc/libcap2/libcap2_2.22.orig.tar.gz | tar -C / -xz && \
+    cd /libcap-2.22 && \
+    sed -i 's/LIBATTR := yes/LIBATTR := no/' Make.Rules && \
+    make && \
+    mkdir -p output && \
+    make prefix=`pwd`/output install && \
+    mkdir -p $ROOTFS/usr/local/lib && \
+    cp -av `pwd`/output/lib64/* $ROOTFS/usr/local/lib
+
+
+RUN jobs=$(nproc); \
+    cd /linux-kernel && \
+    ARCH=um make -j ${jobs}
+
+# Prepare the ISO directory with the kernel
+#RUN cp -v /linux-kernel/arch/um/boot/bzImage /tmp/iso/boot/vmlinuz64
+
+CMD ["cat", "/linux-kernel/vmlinux"]

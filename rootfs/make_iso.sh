@@ -33,9 +33,16 @@ SUPPORT_URL="https://github.com/boot2docker/boot2docker"
 BUG_REPORT_URL="https://github.com/boot2docker/boot2docker/issues"
 EOOS
 
+# Remove serial consoles
+sed -i '/^ttyS[01]/d' $ROOTFS/etc/inittab 
+sed -i 's/tty1/tty0/;' $ROOTFS/etc/inittab 
+
 # Pack the rootfs
-cd $ROOTFS
-find | ( set -x; cpio -o -H newc | xz -9 --format=lzma --verbose --verbose ) > /tmp/iso/boot/initrd.img
+#cd $ROOTFS
+#find | ( set -x; cpio -o -H newc ) > /tmp/iso/boot/initrd.img
+#find | ( set -x; cpio -o -H newc | xz -9 --format=lzma --verbose --verbose ) > /tmp/iso/boot/initrd.img
+
+exit 0
 cd -
 
 # Make the ISO
